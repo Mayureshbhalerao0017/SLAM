@@ -1,0 +1,231 @@
+function slam_comparison_driver_fsae_rect()
+% SLAM COMPARISON ON ROUNDED RECTANGULAR FSAE TRACK
+% EKF SLAM vs FastSLAM vs GraphSLAM
+
+clc; clear; close all;
+
+%% ================= CONFIG =================
+DT = 0.1;
+SIM_TIME = 60.0;
+
+Q_true = diag([0.08, 0.3, deg2rad(1.0)]).^2;
+Q_solver = Q_true;
+
+R_true = diag([0.6, deg2rad(6.5)]).^2;
+R_solver = R_true;
+
+%% ========== GENERATE DATA ==========
+fprintf('--- Generating Rounded Rectangular Track ---\n');
+[time_vec, hx_true, data_log, lm_true] = ...
+    generate_fsae_rect_track(DT, SIM_TIME, Q_true, R_true);
+
+fprintf('Steps: %d | Cones: %d\n', length(time_vec), size(lm_true,2));
+
+%% ================= EKF SLAM =================
+fprintf('\n--- Running EKF SLAM ---\n');
+x_ekf = []; P_ekf = []; lm_ids = [];
+hx_ekf = zeros(3,length(time_vec));
+
+tic;
+for k = 1:length(time_vec)
+    u = data_log(k).u;
+    z = data_log(k).z_ekf;
+
+    [x_ekf, P_ekf, lm_ids, ~] = ekf_slam( ...
+        x_ekf, P_ekf, z, R_solver, ...
+        u(1), u(2), u(3), DT, ...
+        Q_solver, true, lm_ids);
+
+    hx_ekf(:,k) = x_ekf(1:3);
+end
+t_ekf = toc;
+
+%% ================= FASTSLAM =================
+fprintf('\n--- Running FastSLAM ---\n');
+N_PARTICLE = 200;
+particles = init_particles(N_PARTICLE);
+hx_fast = zeros(3,length(time_vec));
+
+tic;
+for k = 1:length(time_vec)
+    u_fast = [data_log(k).u(1); data_log(k).u(3)];
+    z_fast = data_log(k).z_fast;
+    particles = fast_slam_core(particles, u_fast, z_fast);
+    hx_fast(:,k) = calc_particle_mean(particles);
+end
+t_fast = toc;
+
+%% ================= GRAPH SLAM =================
+fprintf('\n--- Running Graph SLAM ---\n');
+hxDR = zeros(3,length(time_vec));
+x = [0;0;0];
+
+for k = 1:length(time_vec)
+    u = data_log(k).u;
+    x = motion_model(x,[u(1);u(3)],DT);
+    hxDR(:,k) = x;
+end
+
+hz_graph = cell(1,length(time_vec));
+for k = 1:length(time_vec)
+    z = data_log(k).z_fast;
+    if isempty(z)
+        hz_graph{k} = [];
+    else
+        hz_graph{k} = [z(1,:)', z(2,:)', zeros(size(z,2),1), z(3,:)'];
+    end
+end
+
+tic;
+x_graph = graph_slam_core(hxDR, hz_graph, 15, 2, 4, deg2rad(8));
+t_graph = toc;
+
+hx_graph = x_graph(1:3,:);
+
+%% ================= METRICS =================
+rmse_ekf   = calc_rmse(hx_true, hx_ekf);
+rmse_fast  = calc_rmse(hx_true, hx_fast);
+rmse_graph = calc_rmse(hx_true, hx_graph);
+
+%% ================= PLOTS =================
+figure('Color','w','Position',[100 100 1400 600])
+
+subplot(1,2,1); hold on; grid on; axis equal;
+plot(lm_true(1,:),lm_true(2,:),'y*','DisplayName','Cones');
+plot(hx_true(1,:),hx_true(2,:),'w--','LineWidth',2,'DisplayName','Ground Truth');
+plot(hx_ekf(1,:),hx_ekf(2,:),'b','DisplayName','EKF');
+plot(hx_fast(1,:),hx_fast(2,:),'g','DisplayName','FastSLAM');
+plot(hx_graph(1,:),hx_graph(2,:),'r','DisplayName','Graph SLAM');
+legend;
+title('Rounded Rectangular FSAE Track',Color='k');
+
+subplot(1,2,2)
+bar([t_ekf t_fast t_graph]); hold on
+plot([rmse_ekf rmse_fast rmse_graph],'ro-','LineWidth',2)
+set(gca,'XTickLabel',{'EKF','FastSLAM','Graph'},color=')
+ylabel('Time / RMSE',color='k'); grid on
+
+fprintf('\nMETHOD      TIME(s)    RMSE(m)\n');
+fprintf('EKF        %.3f     %.3f\n',t_ekf,rmse_ekf);
+fprintf('FastSLAM   %.3f     %.3f\n',t_fast,rmse_fast);
+fprintf('GraphSLAM  %.3f     %.3f\n',t_graph,rmse_graph);
+
+end
+function [time_vec, hx_true, data_log, lm] = ...
+    generate_fsae_rect_track(dt, T, Q, R)
+
+track_width = 3.0;
+cone_spacing = 2.0;
+v_nom = 7.0;
+
+L = 50;        % straight length
+Rturn = 12;    % corner radius
+
+%% ===== BUILD CENTERLINE =====
+cx = []; cy = []; psi = [];
+
+% 1) Straight
+s = 0:dt*v_nom:L;
+cx = [cx, s];
+cy = [cy, zeros(size(s))];
+psi = [psi, zeros(size(s))];
+
+% 2) First 180° turn
+theta = linspace(0,pi,round(pi*Rturn/(v_nom*dt)));
+cx = [cx, L + Rturn*sin(theta)];
+cy = [cy, Rturn*(1-cos(theta))];
+psi = [psi, theta];
+
+% 3) Straight back
+s = 0:dt*v_nom:L;
+cx = [cx, L - s];
+cy = [cy, 2*Rturn*ones(size(s))];
+psi = [psi, pi*ones(size(s))];
+
+% 4) Second 180° turn
+theta = linspace(pi,2*pi,round(pi*Rturn/(v_nom*dt)));
+cx = [cx, Rturn*sin(theta)];
+cy = [cy, Rturn*(1-cos(theta))];
+psi = [psi, theta];
+
+%% ===== CONES =====
+lm = [];
+for i = 1:round(cone_spacing/(v_nom*dt)):length(cx)
+    n = [-sin(psi(i)); cos(psi(i))];
+    lm = [lm, ...
+          [cx(i);cy(i)] + n*track_width/2, ...
+          [cx(i);cy(i)] - n*track_width/2];
+end
+
+assignin('base','N_LANDMARKS',size(lm,2));
+
+%% ===== TIME & TRUTH =====
+N = length(cx);
+time_vec = (0:N-1)*dt;
+hx_true = [cx;cy;psi];
+
+%% ===== MEASUREMENTS =====
+data_log = struct('u',{},'z_ekf',{},'z_fast',{});
+
+for k = 1:N
+    if k<N
+        w = (psi(k+1)-psi(k))/dt;
+    else
+        w = 0;
+    end
+
+    vn = v_nom + randn*sqrt(Q(1,1));
+    wn = w     + randn*sqrt(Q(3,3));
+
+    z_ekf=[]; z_fast=[];
+    for i=1:size(lm,2)
+        dx=lm(1,i)-cx(k);
+        dy=lm(2,i)-cy(k);
+        r=hypot(dx,dy);
+        b=wrapToPi_local(atan2(dy,dx)-psi(k));
+        if r<12 && abs(b)<deg2rad(60)
+            z_ekf=[z_ekf,[r+randn*sqrt(R(1,1)); b+randn*sqrt(R(2,2))]];
+            z_fast=[z_fast,[r;b;i]];
+        end
+    end
+
+    data_log(k).u=[vn;0;wn];
+    data_log(k).z_ekf=z_ekf;
+    data_log(k).z_fast=z_fast;
+end
+end
+function x = motion_model(x,u,dt)
+x(1)=x(1)+u(1)*cos(x(3))*dt;
+x(2)=x(2)+u(1)*sin(x(3))*dt;
+x(3)=wrapToPi_local(x(3)+u(2)*dt);
+end
+
+function particles = init_particles(N)
+N_LM = evalin('base','N_LANDMARKS');
+p.w=1/N; p.x=0; p.y=0; p.yaw=0;
+p.lm=zeros(N_LM,2);
+p.lmP=zeros(2*N_LM,2);
+particles=repmat(p,N,1);
+end
+
+function x_mean = calc_particle_mean(particles)
+x=0; y=0; cx=0; cy=0;
+for i=1:length(particles)
+    w=particles(i).w;
+    x=x+w*particles(i).x;
+    y=y+w*particles(i).y;
+    cx=cx+w*cos(particles(i).yaw);
+    cy=cy+w*sin(particles(i).yaw);
+end
+x_mean=[x;y;atan2(cy,cx)];
+end
+
+function rmse = calc_rmse(x_true,x_est)
+n=min(size(x_true,2),size(x_est,2));
+e=x_true(1:2,1:n)-x_est(1:2,1:n);
+rmse=sqrt(mean(sum(e.^2,1)));
+end
+
+function a = wrapToPi_local(a)
+a = mod(a+pi,2*pi)-pi;
+end
