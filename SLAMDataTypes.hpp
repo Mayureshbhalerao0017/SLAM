@@ -22,4 +22,8 @@ struct Landmark {
     double confidence; // Number of hits or probability
 };
 
+inline double wrapToPi(double angle) {
+    return std::atan2(std::sin(angle), std::cos(angle));
+}
+
 } 
